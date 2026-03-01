@@ -97,6 +97,12 @@ This repo includes `.github/workflows/container.yml`, which builds and publishes
 - `ghcr.io/jbhoorasingh/aws-vpc-flow-logs-visualizer:v*` when you push a version tag
 - `ghcr.io/jbhoorasingh/aws-vpc-flow-logs-visualizer:sha-...` for immutable deploys
 
+Single-line deploy from GHCR:
+
+```bash
+docker run -d --name aws-vpc-flow-logs-visualizer --restart unless-stopped -p 8000:8000 ghcr.io/jbhoorasingh/aws-vpc-flow-logs-visualizer:latest
+```
+
 ## Core API Endpoints
 
 - `GET /api/health/`

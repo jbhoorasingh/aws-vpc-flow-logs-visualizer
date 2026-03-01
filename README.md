@@ -9,11 +9,65 @@ This starter implements a full-stack baseline for your use case:
 - visualize provider/consumer relationships as a bubble mesh graph
 - generate firewall rule suggestions from observed traffic
 
+## Table of Contents
+
+- [Project Layout](#project-layout)
+- [Screenshots \& Demo](#screenshots--demo)
+- [Backend Setup](#backend-setup)
+- [Frontend Setup](#frontend-setup)
+- [Container (Docker)](#container-docker)
+- [GitHub Container Registry (GHCR)](#github-container-registry-ghcr)
+- [Core API Endpoints](#core-api-endpoints)
+- [Example Upload Request](#example-upload-request)
+- [Notes](#notes)
+
 ## Project Layout
 
 - `backend/` Django + DRF API
 - `frontend/` React (Vite) UI
-- `stitch_exports/` downloaded Stitch artifacts
+
+## Screenshots & Demo
+
+- Demo video: [Streamable walkthrough](https://streamable.com/26qh7e)
+
+<table>
+  <tr>
+    <td align="center">
+      <b>Dashboard</b><br />
+      <a href="docs/images/image_dash.png">
+        <img src="docs/images/image_dash.png" alt="Dashboard" width="420" />
+      </a>
+    </td>
+    <td align="center">
+      <b>Map View</b><br />
+      <a href="docs/images/image_map.png">
+        <img src="docs/images/image_map.png" alt="Map view" width="420" />
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <b>Flow Logs</b><br />
+      <a href="docs/images/image_flowlogs.png">
+        <img src="docs/images/image_flowlogs.png" alt="Flow logs" width="420" />
+      </a>
+    </td>
+    <td align="center">
+      <b>Assets</b><br />
+      <a href="docs/images/image_assets.png">
+        <img src="docs/images/image_assets.png" alt="Assets" width="420" />
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <b>Firewall Simulator</b><br />
+      <a href="docs/images/image_firewal_sim.png">
+        <img src="docs/images/image_firewal_sim.png" alt="Firewall simulator" width="520" />
+      </a>
+    </td>
+  </tr>
+</table>
 
 ## Backend Setup
 
@@ -25,6 +79,18 @@ poetry run python manage.py runserver
 ```
 
 Backend runs on `http://localhost:8000`.
+
+Seed realistic demo data (assets/groups/flows/correlations + firewall simulator snapshots):
+
+```bash
+./scripts/seed_demo_data.sh
+```
+
+Equivalent direct command:
+
+```bash
+cd backend && poetry run python manage.py seed_demo_data --reset --source demo-seed --seed 20260301 --days 14 --flow-pairs 2200
+```
 
 Database behavior:
 

@@ -218,3 +218,8 @@ curl -X POST http://localhost:8000/api/uploads/flow-logs/ \
 - Firewall recommendations aggregate by CIDR group when available; otherwise by host CIDR.
 - Service mesh view uses Cytoscape.js with interactive zoom/pan, layout switching, and node/edge inspection.
 - SQLite is configured by default for fast local iteration.
+
+## License
+
+This project is licensed under the custom non-commercial license in [`LICENSE`](LICENSE).
+Commercial use is reserved for the Licensor.

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, extractResults } from "../lib/api";
 import { formatInt } from "../lib/graph";
 import Icon from "../components/Icon";
@@ -44,6 +44,165 @@ const EMPTY_GROUP_FORM = {
   description: "",
 };
 
+const SETTINGS_EXPORT_VERSION = 1;
+const EXPORT_PAGE_SIZE = 500;
+
+async function listAllPages(listFn, pageSize = EXPORT_PAGE_SIZE) {
+  let page = 1;
+  const results = [];
+
+  for (;;) {
+    const response = await listFn({ page, page_size: pageSize });
+    const chunk = extractResults(response);
+    results.push(...chunk);
+
+    if (!Array.isArray(response?.results)) {
+      break;
+    }
+
+    const total = Number(response?.count || 0);
+    if (total > 0 && results.length >= total) {
+      break;
+    }
+    if (chunk.length < pageSize) {
+      break;
+    }
+
+    page += 1;
+  }
+
+  return results;
+}
+
+function fileTimestamp() {
+  return new Date().toISOString().replaceAll(":", "-").split(".")[0];
+}
+
+function downloadJson(filename, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = window.URL.createObjectURL(blob);
+  const anchor = window.document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  window.document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.URL.revokeObjectURL(url);
+}
+
+async function readJsonFile(file) {
+  const rawText = await file.text();
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    throw new Error("Selected file is not valid JSON.");
+  }
+}
+
+function getImportItems(payload, acceptedKeys, entityLabel) {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  if (!payload || typeof payload !== "object") {
+    throw new Error(`${entityLabel} JSON must be an array or object.`);
+  }
+
+  for (const key of acceptedKeys) {
+    if (Array.isArray(payload[key])) {
+      return payload[key];
+    }
+  }
+
+  throw new Error(
+    `${entityLabel} JSON must be an array or include one of: ${acceptedKeys.join(", ")}.`,
+  );
+}
+
+function normalizeIpMetadataImportItems(items) {
+  return items.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Asset item ${index + 1} must be an object.`);
+    }
+
+    const ipAddress = String(item.ip_address || "").trim();
+    if (!ipAddress) {
+      throw new Error(`Asset item ${index + 1} is missing ip_address.`);
+    }
+
+    const normalized = { ip_address: ipAddress };
+    const textFields = [
+      "name",
+      "asset_kind",
+      "instance_id",
+      "interface_id",
+      "instance_type",
+      "state",
+      "region",
+      "availability_zone",
+      "account_owner",
+      "provider",
+    ];
+
+    textFields.forEach((field) => {
+      if (item[field] == null) return;
+      const value = String(item[field]).trim();
+      if (!value) return;
+      normalized[field] = field === "asset_kind" ? value.toUpperCase() : value;
+    });
+
+    if (item.tags !== undefined) {
+      normalized.tags = item.tags;
+    }
+    if (item.attributes !== undefined) {
+      normalized.attributes = item.attributes;
+    }
+
+    return normalized;
+  });
+}
+
+function normalizeNetworkGroupImportItems(items) {
+  return items.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Network group item ${index + 1} must be an object.`);
+    }
+
+    const name = String(item.name || "").trim();
+    if (!name) {
+      throw new Error(`Network group item ${index + 1} is missing name.`);
+    }
+
+    const normalized = { name };
+    const kind = String(item.kind || "").trim();
+    if (kind) {
+      normalized.kind = kind.toUpperCase();
+    }
+
+    const cidrsRaw = Array.isArray(item.cidrs)
+      ? item.cidrs
+      : item.cidr
+        ? [item.cidr]
+        : [];
+    const cidrs = cidrsRaw.map((value) => String(value || "").trim()).filter(Boolean);
+    if (cidrs.length === 0) {
+      throw new Error(`Network group "${name}" is missing cidrs.`);
+    }
+    normalized.cidrs = cidrs;
+
+    if (Array.isArray(item.tags)) {
+      normalized.tags = item.tags.map((value) => String(value || "").trim()).filter(Boolean);
+    } else if (typeof item.tags === "string") {
+      normalized.tags = parseCommaList(item.tags);
+    }
+
+    if (item.description != null) {
+      normalized.description = String(item.description);
+    }
+
+    return normalized;
+  });
+}
+
 export default function SettingsPage() {
   const [health, setHealth] = useState(null);
   const [imports, setImports] = useState([]);
@@ -55,9 +214,12 @@ export default function SettingsPage() {
   const [groupForm, setGroupForm] = useState(EMPTY_GROUP_FORM);
   const [groupFormSaving, setGroupFormSaving] = useState(false);
   const [groupFormError, setGroupFormError] = useState("");
+  const assetImportInputRef = useRef(null);
+  const groupImportInputRef = useRef(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
+    setError("");
     const errors = [];
 
     const [healthRes, importsRes, groupsRes] = await Promise.allSettled([
@@ -249,6 +411,100 @@ export default function SettingsPage() {
     }
   }
 
+  async function handleExportAssetsJson() {
+    setWorkingKey("export-assets-json");
+    setError("");
+    setSuccess("");
+    try {
+      const assets = await listAllPages((params) => api.listIpMetadata(params));
+      const items = normalizeIpMetadataImportItems(assets);
+
+      downloadJson(`assets-${fileTimestamp()}.json`, {
+        version: SETTINGS_EXPORT_VERSION,
+        type: "assets",
+        exported_at: new Date().toISOString(),
+        item_count: items.length,
+        items,
+      });
+      setSuccess(`Exported ${formatInt(items.length)} assets to JSON.`);
+    } catch (err) {
+      setError(err.message || "Failed to export assets JSON.");
+    } finally {
+      setWorkingKey("");
+    }
+  }
+
+  async function handleImportAssetsJson(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    setWorkingKey("import-assets-json");
+    setError("");
+    setSuccess("");
+    try {
+      const parsed = await readJsonFile(file);
+      const importedItems = getImportItems(parsed, ["items", "assets", "ip_metadata"], "Assets");
+      const items = normalizeIpMetadataImportItems(importedItems);
+      const result = await api.importIpMetadata(items);
+      setSuccess(
+        `Imported assets from ${file.name}. Created ${formatInt(result?.created || 0)}, updated ${formatInt(result?.updated || 0)}.`,
+      );
+      await fetchData();
+    } catch (err) {
+      setError(err.message || "Failed to import assets JSON.");
+    } finally {
+      setWorkingKey("");
+    }
+  }
+
+  async function handleExportGroupsJson() {
+    setWorkingKey("export-groups-json");
+    setError("");
+    setSuccess("");
+    try {
+      const networkGroups = await listAllPages((params) => api.listNetworkGroups(params));
+      const items = normalizeNetworkGroupImportItems(networkGroups);
+
+      downloadJson(`network-groups-${fileTimestamp()}.json`, {
+        version: SETTINGS_EXPORT_VERSION,
+        type: "network-groups",
+        exported_at: new Date().toISOString(),
+        item_count: items.length,
+        items,
+      });
+      setSuccess(`Exported ${formatInt(items.length)} network groups to JSON.`);
+    } catch (err) {
+      setError(err.message || "Failed to export network groups JSON.");
+    } finally {
+      setWorkingKey("");
+    }
+  }
+
+  async function handleImportGroupsJson(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    setWorkingKey("import-groups-json");
+    setError("");
+    setSuccess("");
+    try {
+      const parsed = await readJsonFile(file);
+      const importedItems = getImportItems(parsed, ["items", "network_groups", "groups"], "Network groups");
+      const items = normalizeNetworkGroupImportItems(importedItems);
+      const result = await api.importNetworkGroups(items);
+      setSuccess(
+        `Imported network groups from ${file.name}. Created ${formatInt(result?.created || 0)}, updated ${formatInt(result?.updated || 0)}.`,
+      );
+      await fetchData();
+    } catch (err) {
+      setError(err.message || "Failed to import network groups JSON.");
+    } finally {
+      setWorkingKey("");
+    }
+  }
+
   return (
     <div className="p-6 max-w-6xl mx-auto flex flex-col gap-3">
       <div className="bg-white border border-neutral-200 rounded-2xl p-4 shadow-sm">
@@ -256,7 +512,7 @@ export default function SettingsPage() {
           <div>
             <h2 className="text-lg font-semibold text-slate-900">Settings</h2>
             <p className="text-sm text-slate-500">
-              Manage stored logs and network group data.
+              Manage stored logs, assets, and network group data.
             </p>
           </div>
           <button
@@ -280,6 +536,99 @@ export default function SettingsPage() {
           {success}
         </div>
       )}
+
+      <div className="bg-white border border-neutral-200 rounded-2xl p-4 shadow-sm">
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">Import / Export JSON</h3>
+            <p className="text-xs text-slate-500">
+              Backup and restore assets and network groups.
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="rounded-xl border border-neutral-200 p-3 bg-neutral-50/60">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Assets</p>
+                <p className="text-xs text-slate-500">
+                  IP metadata entries: {formatInt(health?.ip_metadata ?? 0)}
+                </p>
+              </div>
+            </div>
+            <input
+              ref={assetImportInputRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={handleImportAssetsJson}
+            />
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => assetImportInputRef.current?.click()}
+                disabled={loading || !!workingKey || groupFormSaving}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-neutral-300 hover:bg-neutral-100 transition-colors disabled:opacity-50"
+              >
+                <Icon name="upload_file" size={14} />
+                {workingKey === "import-assets-json" ? "Importing..." : "Import JSON"}
+              </button>
+              <button
+                type="button"
+                onClick={handleExportAssetsJson}
+                disabled={loading || !!workingKey || groupFormSaving}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-neutral-300 hover:bg-neutral-100 transition-colors disabled:opacity-50"
+              >
+                <Icon name="download" size={14} />
+                {workingKey === "export-assets-json" ? "Exporting..." : "Export JSON"}
+              </button>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-neutral-200 p-3 bg-neutral-50/60">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Network Groups</p>
+                <p className="text-xs text-slate-500">
+                  Groups: {formatInt(health?.network_groups ?? groups.length)}
+                </p>
+              </div>
+            </div>
+            <input
+              ref={groupImportInputRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={handleImportGroupsJson}
+            />
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => groupImportInputRef.current?.click()}
+                disabled={loading || !!workingKey || groupFormSaving}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-neutral-300 hover:bg-neutral-100 transition-colors disabled:opacity-50"
+              >
+                <Icon name="upload_file" size={14} />
+                {workingKey === "import-groups-json" ? "Importing..." : "Import JSON"}
+              </button>
+              <button
+                type="button"
+                onClick={handleExportGroupsJson}
+                disabled={loading || !!workingKey || groupFormSaving}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-neutral-300 hover:bg-neutral-100 transition-colors disabled:opacity-50"
+              >
+                <Icon name="download" size={14} />
+                {workingKey === "export-groups-json" ? "Exporting..." : "Export JSON"}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <p className="text-[11px] text-slate-500 mt-2">
+          Import merges by IP address for assets and by name for network groups.
+        </p>
+      </div>
 
       <div className="bg-white border border-neutral-200 rounded-2xl p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3 mb-3">

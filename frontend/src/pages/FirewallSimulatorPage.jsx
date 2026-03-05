@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ipaddr from "ipaddr.js";
 import { api, extractResults } from "../lib/api";
 import { formatBytes, formatInt } from "../lib/graph";
@@ -7,6 +7,7 @@ import Icon from "../components/Icon";
 const SIMULATOR_RULES_STORAGE_KEY = "firewall-simulator-rules-v1";
 const SOURCE_META_PREFIX = "[FIREWALL_SIM_SOURCE]";
 const PAGE_SIZE = 1000;
+const RULESET_EXPORT_VERSION = 1;
 
 const PROTOCOL_NAMES = {
   1: "ICMP",
@@ -451,6 +452,94 @@ function hydrateStoredRules(value) {
     .filter((rule) => rule.id);
 }
 
+function normalizeImportedRulesPayload(payload) {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+
+  if (payload && typeof payload === "object" && Array.isArray(payload.rules)) {
+    return payload.rules;
+  }
+
+  throw new Error("Ruleset JSON must be an array of rules or an object with a `rules` array.");
+}
+
+function validateImportedRules(rules) {
+  rules.forEach((rule, index) => {
+    const ruleLabel = rule.name || `Rule ${index + 1}`;
+    const protocolValue = String(rule.protocol || "ANY");
+    const destinationPort = String(rule.destinationPort || "").trim();
+
+    if (rule.sourceType === "IP_CIDR") {
+      if (!rule.sourceValue) {
+        throw new Error(`${ruleLabel}: source IP/CIDR is required.`);
+      }
+      try {
+        parseNetwork(rule.sourceValue);
+      } catch (err) {
+        throw new Error(`${ruleLabel}: source address is invalid (${err.message}).`);
+      }
+    }
+
+    if (rule.sourceType === "GROUP" && !rule.sourceGroupId) {
+      throw new Error(`${ruleLabel}: source group is required.`);
+    }
+
+    if (rule.destinationType === "IP_CIDR") {
+      if (!rule.destinationValue) {
+        throw new Error(`${ruleLabel}: destination IP/CIDR is required.`);
+      }
+      try {
+        parseNetwork(rule.destinationValue);
+      } catch (err) {
+        throw new Error(`${ruleLabel}: destination address is invalid (${err.message}).`);
+      }
+    }
+
+    if (rule.destinationType === "GROUP" && !rule.destinationGroupId) {
+      throw new Error(`${ruleLabel}: destination group is required.`);
+    }
+
+    if (!["ANY", "1", "6", "17"].includes(protocolValue)) {
+      throw new Error(`${ruleLabel}: protocol must be Any, ICMP (1), TCP (6), or UDP (17).`);
+    }
+
+    if (protocolValue === "1") {
+      if (destinationPort && destinationPort !== "0") {
+        throw new Error(`${ruleLabel}: ICMP destination port must be 0.`);
+      }
+      return;
+    }
+
+    if (destinationPort) {
+      const port = Number(destinationPort);
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+        throw new Error(`${ruleLabel}: destination port must be between 1 and 65535.`);
+      }
+    }
+  });
+}
+
+function buildRulesetExportPayload(rules) {
+  return {
+    version: RULESET_EXPORT_VERSION,
+    exported_at: new Date().toISOString(),
+    rule_count: rules.length,
+    rules: rules.map((rule) => ({
+      id: String(rule.id || ""),
+      name: String(rule.name || "").trim(),
+      sourceType: String(rule.sourceType || "ANY"),
+      sourceValue: String(rule.sourceValue || "").trim(),
+      sourceGroupId: String(rule.sourceGroupId || ""),
+      destinationType: String(rule.destinationType || "ANY"),
+      destinationValue: String(rule.destinationValue || "").trim(),
+      destinationGroupId: String(rule.destinationGroupId || ""),
+      protocol: String(rule.protocol || "ANY"),
+      destinationPort: String(rule.destinationPort || "").trim(),
+    })),
+  };
+}
+
 export default function FirewallSimulatorPage() {
   const [loading, setLoading] = useState(true);
   const [busyKey, setBusyKey] = useState("");
@@ -475,6 +564,7 @@ export default function FirewallSimulatorPage() {
   const [groupFormError, setGroupFormError] = useState("");
 
   const [showUnmatchedOnly, setShowUnmatchedOnly] = useState(false);
+  const importRulesInputRef = useRef(null);
 
   useEffect(() => {
     try {
@@ -817,6 +907,59 @@ export default function FirewallSimulatorPage() {
     setRuleFormError("");
   }
 
+  function handleExportRules() {
+    setError("");
+    setSuccess("");
+    try {
+      const payload = buildRulesetExportPayload(rules);
+      const jsonText = JSON.stringify(payload, null, 2);
+      const blob = new Blob([jsonText], { type: "application/json" });
+      const objectUrl = window.URL.createObjectURL(blob);
+      const timestamp = new Date().toISOString().replaceAll(":", "-").split(".")[0];
+      const anchor = window.document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `firewall-ruleset-${timestamp}.json`;
+      window.document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(objectUrl);
+      setSuccess(`Exported ${formatInt(rules.length)} rule${rules.length === 1 ? "" : "s"} to JSON.`);
+    } catch (err) {
+      setError(err.message || "Failed to export ruleset JSON.");
+    }
+  }
+
+  async function handleImportRulesFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    setError("");
+    setSuccess("");
+    setRuleFormError("");
+
+    try {
+      const fileText = await file.text();
+      let parsed;
+      try {
+        parsed = JSON.parse(fileText);
+      } catch {
+        throw new Error("Selected file is not valid JSON.");
+      }
+
+      const incomingRules = normalizeImportedRulesPayload(parsed);
+      const hydratedRules = hydrateStoredRules(incomingRules);
+      validateImportedRules(hydratedRules);
+
+      setRules(hydratedRules);
+      setSuccess(
+        `Imported ${formatInt(hydratedRules.length)} rule${hydratedRules.length === 1 ? "" : "s"} from ${file.name}.`,
+      );
+    } catch (err) {
+      setError(err.message || "Failed to import ruleset JSON.");
+    }
+  }
+
   async function handleSaveGroup(event) {
     event.preventDefault();
     setGroupFormError("");
@@ -1032,14 +1175,41 @@ export default function FirewallSimulatorPage() {
           <div className="bg-white border border-neutral-200 rounded-2xl p-4 shadow-sm">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold text-slate-900">Rule Set</h3>
-              <button
-                type="button"
-                onClick={clearRules}
-                disabled={rules.length === 0}
-                className="text-xs text-slate-500 hover:text-primary transition-colors disabled:opacity-50"
-              >
-                Clear Rules
-              </button>
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                <input
+                  ref={importRulesInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  className="hidden"
+                  onChange={handleImportRulesFile}
+                />
+                <button
+                  type="button"
+                  onClick={() => importRulesInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-neutral-300 hover:bg-neutral-100 transition-colors"
+                >
+                  <Icon name="upload_file" size={14} />
+                  Import JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportRules}
+                  disabled={rules.length === 0}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-neutral-300 hover:bg-neutral-100 transition-colors disabled:opacity-50"
+                >
+                  <Icon name="download" size={14} />
+                  Export JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={clearRules}
+                  disabled={rules.length === 0}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-500 border border-neutral-300 hover:bg-neutral-100 transition-colors disabled:opacity-50"
+                >
+                  <Icon name="delete" size={14} />
+                  Clear Rules
+                </button>
+              </div>
             </div>
 
             <form

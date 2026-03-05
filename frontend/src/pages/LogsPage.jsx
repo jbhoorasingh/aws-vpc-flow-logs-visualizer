@@ -37,6 +37,85 @@ const INSTANCE_ASSET_FIELD_PAIRS = [
 const DEFAULT_VPC_LOG_FORMAT =
   "version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status";
 
+const EMPTY_RAW_FILTERS = {
+  advanced_filter: "",
+  since: "",
+  until: "",
+};
+
+function toIsoDateTime(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toISOString();
+}
+
+function toDateTimeLocalValue(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  const hours = String(parsed.getHours()).padStart(2, "0");
+  const minutes = String(parsed.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+}
+
+function getTimeRangeError(since, until) {
+  if (!since || !until) return "";
+  const sinceDate = new Date(since);
+  const untilDate = new Date(until);
+  if (Number.isNaN(sinceDate.getTime()) || Number.isNaN(untilDate.getTime())) {
+    return "Enter a valid start and end time.";
+  }
+  if (sinceDate > untilDate) {
+    return "Start time must be before end time.";
+  }
+  return "";
+}
+
+function encodeFilterToken(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  if (/[\s()]/.test(text)) {
+    const escaped = text.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+    return `"${escaped}"`;
+  }
+  return text;
+}
+
+function appendAdvancedCondition(existing, condition) {
+  const current = String(existing || "").trim();
+  if (!condition) return current;
+  if (!current) return condition;
+  if (current.includes(condition)) return current;
+  return `(${current}) and (${condition})`;
+}
+
+function buildQuickFilterCondition(field, value) {
+  if (value == null || value === "") return "";
+  const token = encodeFilterToken(value);
+  if (!token) return "";
+
+  switch (field) {
+    case "srcaddr":
+      return `addr.src == ${token}`;
+    case "srcport":
+      return `port.src == ${token}`;
+    case "dstaddr":
+      return `addr.dst == ${token}`;
+    case "dstport":
+      return `port.dst == ${token}`;
+    case "protocol":
+      return `protocol == ${token}`;
+    case "interface_id":
+      return `interface_id == ${token}`;
+    default:
+      return "";
+  }
+}
+
 export default function LogsPage() {
   const PAGE_SIZE = 50;
 
@@ -57,12 +136,8 @@ export default function LogsPage() {
   const [rawError, setRawError] = useState("");
   const [advancedFilterError, setAdvancedFilterError] = useState("");
   const [validatingAdvancedFilter, setValidatingAdvancedFilter] = useState(false);
-  const [rawFilters, setRawFilters] = useState({
-    advanced_filter: "",
-  });
-  const [rawDraft, setRawDraft] = useState({
-    advanced_filter: "",
-  });
+  const [rawFilters, setRawFilters] = useState(() => ({ ...EMPTY_RAW_FILTERS }));
+  const [rawDraft, setRawDraft] = useState(() => ({ ...EMPTY_RAW_FILTERS }));
 
   const fetchRawLogs = useCallback(async (page = 1, filters = {}) => {
     setRawLoading(true);
@@ -72,6 +147,8 @@ export default function LogsPage() {
         page,
         page_size: PAGE_SIZE,
         advanced_filter: filters.advanced_filter || undefined,
+        since: toIsoDateTime(filters.since) || undefined,
+        until: toIsoDateTime(filters.until) || undefined,
       });
       setRawLogs(res?.results || []);
       setRawCount(res?.count || 0);
@@ -184,28 +261,66 @@ export default function LogsPage() {
     }
   }
 
+  function buildFiltersFromDraft(draft = {}) {
+    return {
+      advanced_filter: (draft.advanced_filter || "").trim(),
+      since: draft.since || "",
+      until: draft.until || "",
+    };
+  }
+
+  function applyFilters(filters) {
+    const timeRangeError = getTimeRangeError(filters.since, filters.until);
+    if (timeRangeError) {
+      setRawError(timeRangeError);
+      return false;
+    }
+    setRawError("");
+    setRawFilters(filters);
+    fetchRawLogs(1, filters);
+    return true;
+  }
+
   function handleApplyRawFilters(e) {
     e.preventDefault();
     if (advancedFilterError) {
       setRawError(`Advanced filter: ${advancedFilterError}`);
       return;
     }
-    setRawError("");
-    const nextFilters = {
-      advanced_filter: rawDraft.advanced_filter.trim(),
-    };
-    setRawFilters(nextFilters);
-    fetchRawLogs(1, nextFilters);
+    const nextFilters = buildFiltersFromDraft(rawDraft);
+    applyFilters(nextFilters);
   }
 
   function handleResetRawFilters() {
-    const empty = { advanced_filter: "" };
+    const empty = { ...EMPTY_RAW_FILTERS };
     setRawDraft(empty);
     setRawFilters(empty);
     setAdvancedFilterError("");
     setRawError("");
     fetchRawLogs(1, empty);
   }
+
+  function handleQuickFilter({ field, value }) {
+    if (value == null || value === "") return;
+
+    const nextFilters = { ...rawFilters };
+
+    if (field === "since") {
+      nextFilters.since = toDateTimeLocalValue(value);
+    } else if (field === "until") {
+      nextFilters.until = toDateTimeLocalValue(value);
+    } else {
+      const condition = buildQuickFilterCondition(field, value);
+      if (!condition) return;
+      nextFilters.advanced_filter = appendAdvancedCondition(nextFilters.advanced_filter, condition);
+    }
+
+    setRawDraft(nextFilters);
+    setAdvancedFilterError("");
+    applyFilters(nextFilters);
+  }
+
+  const timeRangeError = getTimeRangeError(rawDraft.since, rawDraft.until);
 
   const inputClass =
     "bg-neutral-light/50 border border-neutral-200 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-primary";
@@ -282,33 +397,73 @@ export default function LogsPage() {
             </div>
           </div>
 
-          <form onSubmit={handleApplyRawFilters} className="grid grid-cols-1 md:grid-cols-5 gap-3">
-            <input
-              value={rawDraft.advanced_filter}
-              onChange={(e) =>
-                setRawDraft((draft) => ({
-                  ...draft,
-                  advanced_filter: e.target.value,
-                }))
-              }
-              placeholder="((addr.src == 10.108.1.1) or (addr.dst == 10.108.1.1)) and (protocol == icmp) and (port.dst == 80)"
-              className="md:col-span-4 bg-neutral-light/50 border border-neutral-200 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-primary"
-            />
-            <button
-              type="submit"
-              className="bg-primary hover:bg-primary-dark text-white font-semibold px-4 py-2 rounded-lg text-sm transition-colors disabled:opacity-50"
-              disabled={rawLoading || validatingAdvancedFilter || !!advancedFilterError}
-            >
-              {rawLoading ? "Loading..." : "Apply"}
-            </button>
-            <div className="md:col-span-5 flex flex-col gap-1">
+          <form onSubmit={handleApplyRawFilters} className="flex flex-col gap-3">
+            <div className="rounded-xl border border-neutral-200 bg-neutral-50/70 p-3">
+              <div className="grid grid-cols-1 xl:grid-cols-12 gap-3 items-end">
+                <label className="flex flex-col gap-1 xl:col-span-6">
+                  <span className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Advanced Filter</span>
+                  <input
+                    value={rawDraft.advanced_filter}
+                    onChange={(e) =>
+                      setRawDraft((draft) => ({
+                        ...draft,
+                        advanced_filter: e.target.value,
+                      }))
+                    }
+                    placeholder="((addr.src == 10.108.1.1) or (addr.dst == 10.108.1.1)) and (protocol == icmp) and (port.dst == 80)"
+                    className={`${inputClass} h-10`}
+                  />
+                </label>
+                <label className="flex flex-col gap-1 xl:col-span-2">
+                  <span className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">Start Time</span>
+                  <input
+                    type="datetime-local"
+                    value={rawDraft.since}
+                    onChange={(e) =>
+                      setRawDraft((draft) => ({
+                        ...draft,
+                        since: e.target.value,
+                      }))
+                    }
+                    className={`${inputClass} h-10`}
+                  />
+                </label>
+                <label className="flex flex-col gap-1 xl:col-span-2">
+                  <span className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold">End Time</span>
+                  <input
+                    type="datetime-local"
+                    value={rawDraft.until}
+                    onChange={(e) =>
+                      setRawDraft((draft) => ({
+                        ...draft,
+                        until: e.target.value,
+                      }))
+                    }
+                    className={`${inputClass} h-10`}
+                  />
+                </label>
+                <button
+                  type="submit"
+                  className="xl:col-span-2 h-10 bg-primary hover:bg-primary-dark text-white font-semibold px-4 rounded-lg text-sm transition-colors disabled:opacity-50 inline-flex items-center justify-center gap-1.5 shadow-lg shadow-primary/20"
+                  disabled={rawLoading || validatingAdvancedFilter || !!advancedFilterError || !!timeRangeError}
+                >
+                  <Icon name="filter_list" size={16} />
+                  {rawLoading ? "Loading..." : "Apply Filters"}
+                </button>
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
               <span className="text-[11px] text-slate-400">
                 Raw flow fields: addr.src, addr.dst, port.src, port.dst, protocol, action, source, interface_id,
                 log_status. Instance/asset fields: instance.name, instance.owner, instance.region, instance.az,
                 instance.tags.KEY (also `asset.*`). Protocol accepts names (`icmp`, `ipip`, `tcp`, `udp`) or numbers.
                 Wildcards are supported for string values (for example `instance.name=*aws*`). Operators: =, ==, !=,
-                and, or, parentheses. See Help for complete syntax and examples.
+                and, or, parentheses. Click Start/End/Source/Destination/Proto/Iface cells to add quick filters.
+                See Help for complete syntax and examples.
               </span>
+              {timeRangeError && (
+                <span className="text-[11px] text-danger">{timeRangeError}</span>
+              )}
               {validatingAdvancedFilter && (
                 <span className="text-[11px] text-slate-400">Validating syntax...</span>
               )}
@@ -327,6 +482,7 @@ export default function LogsPage() {
           loading={rawLoading}
           error={rawError}
           onPageChange={(page) => fetchRawLogs(page, rawFilters)}
+          onQuickFilter={handleQuickFilter}
         />
       </div>
 

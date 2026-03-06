@@ -126,6 +126,7 @@ export default function LogsPage() {
   const [autoCorrelate, setAutoCorrelate] = useState(true);
   const [response, setResponse] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [showFilterHelpModal, setShowFilterHelpModal] = useState(false);
   const [error, setError] = useState("");
@@ -211,6 +212,8 @@ export default function LogsPage() {
     return () => window.removeEventListener("keydown", handleEsc);
   }, [showFilterHelpModal]);
 
+  const UPLOAD_BATCH_SIZE = 50;
+
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
@@ -223,22 +226,53 @@ export default function LogsPage() {
         throw new Error("Select one or more files, or paste flow log lines.");
       }
 
-      const payload = new FormData();
-      payload.append("source", source);
-      payload.append("auto_correlate", String(autoCorrelate));
-      payload.append("log_format", logFormat.trim());
+      const accumulated = { ingested: 0, parse_error_count: 0, correlation: { created: 0, updated: 0 }, file_results: [] };
 
       if (hasFiles) {
-        for (const file of files) {
-          payload.append("files", file);
+        const batches = [];
+        for (let i = 0; i < files.length; i += UPLOAD_BATCH_SIZE) {
+          batches.push(files.slice(i, i + UPLOAD_BATCH_SIZE));
         }
-      }
-      if (hasLines) {
-        payload.append("lines", lines);
+
+        for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+          const batch = batches[batchIdx];
+          setUploadProgress({ current: batchIdx + 1, total: batches.length, files: files.length });
+
+          const payload = new FormData();
+          payload.append("source", source);
+          payload.append("auto_correlate", String(autoCorrelate));
+          payload.append("log_format", logFormat.trim());
+          for (const file of batch) {
+            payload.append("files", file);
+          }
+
+          const data = await api.uploadFlowLogs(payload);
+          accumulated.ingested += data.ingested ?? 0;
+          accumulated.parse_error_count += data.parse_error_count ?? 0;
+          accumulated.correlation.created += data.correlation?.created ?? 0;
+          accumulated.correlation.updated += data.correlation?.updated ?? 0;
+          if (Array.isArray(data.file_results)) {
+            accumulated.file_results.push(...data.file_results);
+          }
+        }
+        setUploadProgress(null);
       }
 
-      const data = await api.uploadFlowLogs(payload);
-      setResponse(data);
+      if (hasLines) {
+        const payload = new FormData();
+        payload.append("source", source);
+        payload.append("auto_correlate", String(autoCorrelate));
+        payload.append("log_format", logFormat.trim());
+        payload.append("lines", lines);
+
+        const data = await api.uploadFlowLogs(payload);
+        accumulated.ingested += data.ingested ?? 0;
+        accumulated.parse_error_count += data.parse_error_count ?? 0;
+        accumulated.correlation.created += data.correlation?.created ?? 0;
+        accumulated.correlation.updated += data.correlation?.updated ?? 0;
+      }
+
+      setResponse(accumulated);
       setLines("");
       setFiles([]);
       setShowUploadModal(false);
@@ -247,6 +281,7 @@ export default function LogsPage() {
       setError(err.message || "Upload failed");
     } finally {
       setUploading(false);
+      setUploadProgress(null);
     }
   }
 
@@ -595,7 +630,11 @@ export default function LogsPage() {
                   className="bg-primary hover:bg-primary-dark text-white font-semibold px-4 py-2 rounded-lg text-sm transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
                   <Icon name="cloud_upload" size={16} />
-                  {uploading ? "Uploading..." : "Upload Logs"}
+                  {uploadProgress
+                    ? `Batch ${uploadProgress.current} / ${uploadProgress.total}…`
+                    : uploading
+                    ? "Uploading..."
+                    : "Upload Logs"}
                 </button>
               </div>
             </form>

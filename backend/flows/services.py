@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 from dataclasses import dataclass, field
 from heapq import nlargest
 from typing import Iterable
@@ -194,20 +195,88 @@ def _aggregate_entries(entries: Iterable[FlowLogEntry]) -> dict[str, CorrelatedA
     return aggregated
 
 
-@transaction.atomic
-def upsert_correlated_flows(entries: Iterable[FlowLogEntry]) -> dict[str, int]:
-    aggregated = _aggregate_entries(entries)
-    if not aggregated:
-        return {"created": 0, "updated": 0}
+_PG_UPSERT_BATCH_SIZE = 500
 
+_PG_UPSERT_SQL = """
+    INSERT INTO flows_correlatedflow (
+        canonical_key, client_ip, server_ip, client_port, server_port,
+        protocol, flow_count, c2s_packets, c2s_bytes, s2c_packets, s2c_bytes,
+        first_seen, last_seen, action_counts, updated_at
+    )
+    VALUES {placeholders}
+    ON CONFLICT (canonical_key) DO UPDATE SET
+        flow_count   = flows_correlatedflow.flow_count   + EXCLUDED.flow_count,
+        c2s_packets  = flows_correlatedflow.c2s_packets  + EXCLUDED.c2s_packets,
+        c2s_bytes    = flows_correlatedflow.c2s_bytes    + EXCLUDED.c2s_bytes,
+        s2c_packets  = flows_correlatedflow.s2c_packets  + EXCLUDED.s2c_packets,
+        s2c_bytes    = flows_correlatedflow.s2c_bytes    + EXCLUDED.s2c_bytes,
+        first_seen   = LEAST(flows_correlatedflow.first_seen, EXCLUDED.first_seen),
+        last_seen    = GREATEST(flows_correlatedflow.last_seen, EXCLUDED.last_seen),
+        action_counts = (
+            SELECT COALESCE(jsonb_object_agg(key, total), '{{}}'::jsonb)
+            FROM (
+                SELECT key, SUM(value::bigint) AS total
+                FROM (
+                    SELECT key, value
+                      FROM jsonb_each_text(flows_correlatedflow.action_counts)
+                    UNION ALL
+                    SELECT key, value
+                      FROM jsonb_each_text(EXCLUDED.action_counts)
+                ) _combined
+                GROUP BY key
+            ) _merged
+        ),
+        updated_at = NOW()
+"""
+
+_PG_ROW_PLACEHOLDER = (
+    "(%s, %s::inet, %s::inet, %s, %s, %s, %s, %s, %s, %s, %s,"
+    " %s::timestamptz, %s::timestamptz, %s::jsonb, NOW())"
+)
+
+
+def _pg_upsert_correlated(aggregated: dict[str, CorrelatedAccumulator]) -> dict[str, int]:
+    items = list(aggregated.values())
+    total = 0
+
+    with connection.cursor() as cursor:
+        for start in range(0, len(items), _PG_UPSERT_BATCH_SIZE):
+            chunk = items[start:start + _PG_UPSERT_BATCH_SIZE]
+            placeholders = []
+            params: list = []
+
+            for acc in chunk:
+                placeholders.append(_PG_ROW_PLACEHOLDER)
+                params.extend([
+                    acc.canonical_key,
+                    acc.client_ip,
+                    acc.server_ip,
+                    acc.client_port,
+                    acc.server_port,
+                    acc.protocol,
+                    acc.flow_count,
+                    acc.c2s_packets,
+                    acc.c2s_bytes,
+                    acc.s2c_packets,
+                    acc.s2c_bytes,
+                    acc.first_seen,
+                    acc.last_seen,
+                    json.dumps(acc.action_counts),
+                ])
+
+            sql = _PG_UPSERT_SQL.format(placeholders=", ".join(placeholders))
+            cursor.execute(sql, params)
+            total += cursor.rowcount
+
+    return {"created": total, "updated": 0}
+
+
+def _sqlite_upsert_correlated(aggregated: dict[str, CorrelatedAccumulator]) -> dict[str, int]:
     keys = list(aggregated.keys())
     existing: dict[str, CorrelatedFlow] = {}
-    if connection.vendor == "sqlite":
-        for key_chunk in _iter_chunks(keys, SQLITE_IN_CLAUSE_LIMIT):
-            for item in CorrelatedFlow.objects.filter(canonical_key__in=key_chunk):
-                existing[item.canonical_key] = item
-    else:
-        existing = {item.canonical_key: item for item in CorrelatedFlow.objects.filter(canonical_key__in=keys)}
+    for key_chunk in _iter_chunks(keys, SQLITE_IN_CLAUSE_LIMIT):
+        for item in CorrelatedFlow.objects.filter(canonical_key__in=key_chunk):
+            existing[item.canonical_key] = item
 
     to_create: list[CorrelatedFlow] = []
     to_update: list[CorrelatedFlow] = []
@@ -251,20 +320,13 @@ def upsert_correlated_flows(entries: Iterable[FlowLogEntry]) -> dict[str, int]:
 
     if to_create:
         CorrelatedFlow.objects.bulk_create(to_create, batch_size=1000)
-
     if to_update:
         CorrelatedFlow.objects.bulk_update(
             to_update,
             fields=[
-                "flow_count",
-                "c2s_packets",
-                "c2s_bytes",
-                "s2c_packets",
-                "s2c_bytes",
-                "first_seen",
-                "last_seen",
-                "action_counts",
-                "updated_at",
+                "flow_count", "c2s_packets", "c2s_bytes",
+                "s2c_packets", "s2c_bytes", "first_seen",
+                "last_seen", "action_counts", "updated_at",
             ],
             batch_size=1000,
         )
@@ -273,8 +335,19 @@ def upsert_correlated_flows(entries: Iterable[FlowLogEntry]) -> dict[str, int]:
 
 
 @transaction.atomic
+def upsert_correlated_flows(entries: Iterable[FlowLogEntry]) -> dict[str, int]:
+    aggregated = _aggregate_entries(entries)
+    if not aggregated:
+        return {"created": 0, "updated": 0}
+
+    if connection.vendor == "sqlite":
+        return _sqlite_upsert_correlated(aggregated)
+    return _pg_upsert_correlated(aggregated)
+
+
 def rebuild_correlated_flows(batch_size: int = 2000) -> dict[str, int]:
-    CorrelatedFlow.objects.all().delete()
+    with transaction.atomic():
+        CorrelatedFlow.objects.all().delete()
 
     created_total = 0
     updated_total = 0
